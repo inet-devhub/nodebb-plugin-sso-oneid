@@ -1,0 +1,24 @@
+{
+  "id": "nodebb-plugin-sso-oneid",
+  "name": "NodeBB OneID SSO",
+  "description": "NodeBB Plugin that allows users to login/register via their OneID account.",
+  "url": "https://github.com/inet-devhub/nodebb-plugin-sso-oneid",
+  "main": "./library.js",
+  "templates": "templates",
+  "hooks": [
+    { "hook": "static:app.load", "method": "init" },
+    { "hook": "filter:auth.list", "method": "getAssociation" },
+    { "hook": "filter:auth.init", "method": "getStrategy" },
+    { "hook": "filter:admin.header.build", "method": "addMenuItem" },
+    { "hook": "static:user.delete", "method": "deleteUserData" },
+    { "hook": "static:user.loggedOut", "method": "userLoggedOut" },
+    { "hook": "filter:user.whitelistFields", "method": "appendUserHashWhitelist" },
+    { "hook": "filter:error.handle", "method": "handleErrors" }
+  ],
+  "modules": {
+    "../admin/plugins/sso-oneid.js": "static/lib/admin.js"
+  },
+  "staticDirs": {
+    "images": "./static/images"
+  }
+}

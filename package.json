@@ -1,0 +1,45 @@
+{
+  "name": "nodebb-plugin-sso-oneid",
+  "version": "1.0.0",
+  "description": "NodeBB OneID OAuth2 SSO",
+  "main": "library.js",
+  "scripts": {
+    "format": "prettier --write \"**/*.{js,cjs,jsx,ts,tsx,md,json}\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/inet-devhub/nodebb-plugin-sso-oneid"
+  },
+  "keywords": [
+    "nodebb",
+    "plugin",
+    "oauth2",
+    "sso",
+    "single sign on",
+    "login"
+  ],
+  "author": {
+    "name": "patcharp",
+    "email": "patcharp@live.com"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/inet-devhub/nodebb-plugin-sso-oneid/issues"
+  },
+  "readme": "",
+  "readmeFilename": "README.md",
+  "dependencies": {
+    "eslint-config-nodebb": "0.1.1",
+    "passport-oauth2": "^1.8.0",
+    "prettier": "^3.5.1",
+    "querystring": "^0.2.1",
+    "utils-merge": "^1.0.1"
+  },
+  "devDependencies": {
+    "eslint": "8.x",
+    "eslint-plugin-import": "2.x"
+  },
+  "nbbpm": {
+    "compatibility": "^4.0.0"
+  }
+}
