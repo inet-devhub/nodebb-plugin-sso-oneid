@@ -1,6 +1,6 @@
 {
   "name": "nodebb-plugin-sso-oneid",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "NodeBB OneID OAuth2 SSO",
   "main": "library.js",
   "scripts": {
