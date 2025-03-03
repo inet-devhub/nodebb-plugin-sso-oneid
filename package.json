@@ -33,6 +33,7 @@
     "passport-oauth2": "^1.8.0",
     "prettier": "^3.5.1",
     "querystring": "^0.2.1",
+    "sharp": "^0.33.5",
     "utils-merge": "^1.0.1"
   },
   "devDependencies": {

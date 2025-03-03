@@ -10,6 +10,7 @@
     { "hook": "filter:auth.list", "method": "getAssociation" },
     { "hook": "filter:auth.init", "method": "getStrategy" },
     { "hook": "filter:admin.header.build", "method": "addMenuItem" },
+    { "hook": "static:api.routes", "method": "addApiRoutes" },
     { "hook": "static:user.delete", "method": "deleteUserData" },
     { "hook": "static:user.loggedOut", "method": "userLoggedOut" },
     { "hook": "filter:user.whitelistFields", "method": "appendUserHashWhitelist" },

@@ -7,6 +7,7 @@ const db = require.main.require('./src/database');
 const middlewareHelpers = require.main.require('./src/middleware/helpers');
 const sockets = require.main.require('./src/socket.io');
 const authenticationController = require.main.require('./src/controllers/authentication');
+const routeHelpers = require.main.require('./src/routes/helpers');
 const nconf = require.main.require('nconf');
 const async = require.main.require('async');
 const winston = require.main.require('winston');
@@ -58,15 +59,15 @@ const logoutAsync = util.promisify((req, callback) => req.logout(callback));
 
 OneIDAuth.init = function (data, callback) {
   winston.verbose('[sso-oneid] Init sso configuration');
-  const hostHelpers = require.main.require('./src/routes/helpers');
-  hostHelpers.setupAdminPageRoute(data.router, '/admin/plugins/sso-oneid', (req, res) => {
+  // const hostHelpers = require.main.require('./src/routes/helpers');
+  routeHelpers.setupAdminPageRoute(data.router, '/admin/plugins/sso-oneid', (req, res) => {
     res.render('admin/plugins/sso-oneid', {
       title: 'One ID',
       baseUrl: nconf.get('url'),
     });
   });
 
-  hostHelpers.setupPageRoute(data.router, '/error/forbidden', [], async (req, res) => {
+  routeHelpers.setupPageRoute(data.router, '/error/forbidden', [], async (req, res) => {
     if (req.loggedIn) res.redirect('/');
     const err = new Error();
     err.code = 'forbidden';
@@ -82,6 +83,74 @@ OneIDAuth.init = function (data, callback) {
   });
 
   callback();
+};
+
+OneIDAuth.addApiRoutes = async ({ router, middleware, helpers }) => {
+  winston.verbose(`[sso-oneid] Add API route`);
+  const middlewares = [middleware.ensureLoggedIn];
+  routeHelpers.setupApiRoute(router, 'get', '/oneid/avatar/:accountID', middlewares, async (req, res) => {
+    winston.verbose(`[sso-oneid] Avatar api was called`);
+    if (!OneIDAuth.intranetEnabled) return helpers.formatApiResponse(502, res, 'Intranet not connected');
+    const isAccountID = function (id) {
+      return /^[0-9]+/.test(id);
+    };
+
+    winston.verbose(`[sso-oneid] Validate Account ID`);
+    const accountID = req.params.accountID;
+    if (!isAccountID(accountID)) return helpers.formatApiResponse(403, res, 'Invalid account id');
+
+    const cropImageToSquare = async function (imageBuffer) {
+      const sharp = require('sharp');
+      try {
+        const image = sharp(imageBuffer);
+        const metadata = await image.metadata();
+
+        const width = metadata.width;
+        const height = metadata.height;
+        const size = Math.min(width, height);
+
+        const left = Math.floor((width - size) / 2);
+        const top = Math.floor((height - size) / 2);
+
+        return await image.extract({ left, top, width: size, height: size }).toBuffer();
+      } catch (e) {
+        winston.error(`[sso-oneid] Crop avatar error ${JSON.stringify(e)}`);
+        throw e;
+      }
+    };
+
+    try {
+      winston.verbose(`[sso-oneid] HttpClient get intranet avatar`);
+      const avatarURL = `${OneIDAuth.intranet.baseURL}/account/${accountID}/avatar`;
+
+      const opts = {
+        method: 'GET',
+        signal: AbortSignal.timeout(3000), // 3 seconds
+        headers: {
+          'content-type': 'application/json',
+          Authorization: `Bearer ${OneIDAuth.intranet.apiKey}`,
+        },
+      };
+
+      const response = await fetch(avatarURL, opts);
+      const { headers } = response;
+      const body = await response.bytes();
+      const squareImg = await cropImageToSquare(body);
+
+      if (response.status == 200) {
+        res.writeHead(response.status, {
+          'Content-Type': headers.get('content-type'),
+        });
+        return res.end(squareImg);
+      }
+
+      winston.warn(`[sso-oneid] Avatar server return error`);
+      helpers.formatApiResponse(500, res, 'Server return error');
+    } catch (e) {
+      winston.error(`[sso-oneid] Fetch user avatar error: ${JSON.stringify(e)}`);
+      return helpers.formatApiResponse(503, res, 'External intranet avatar error');
+    }
+  });
 };
 
 OneIDAuth.clearSession = async function (req, res) {
@@ -147,7 +216,7 @@ OneIDAuth.reloadAuthorization = function (_settings, _callback) {
 OneIDAuth.userLoggedOut = async ({ req, res, uid, sessionID }) => {
   winston.verbose('[sso-oneid] User logged out called');
 
-  sockets.in(`sess_${sessionID}`).emit('checkSession', 0);
+  // sockets.in(`sess_${sessionID}`).emit('checkSession', 0);
   const redirectURL = `${OneIDAuth.baseURL}/api/oauth/logout?redirect_url=${nconf.get('url')}`;
   const payload = {
     next: redirectURL,
@@ -191,7 +260,7 @@ OneIDAuth.getStrategy = function (strategies, callback) {
     if (settings.url) options.callbackURL = settings.url + '/auth/' + constants.name.toLowerCase() + '/callback';
 
     // Load sso-oneid config
-    OneIDAuth.intranetEnabled = settings.intranetEnabled;
+    OneIDAuth.intranetEnabled = settings.intranetSyncEnabled;
     OneIDAuth.intranet = {
       baseURL: settings.intranetApiServer,
       apiKey: settings.intranetApiKey,
@@ -420,15 +489,8 @@ OneIDAuth.login = function (profile, callback) {
 
   // Success login
   const success = async uid => {
-    // Auto confirm email
-    await User.setUserField(uid, 'email', profile.email);
-    await User.email.confirmByUid(uid);
-
     await User.setUserField(uid, 'oneid', profile.id);
     await db.setObjectField('oneid:uid', profile.id, uid);
-
-    const systemGroupsToJoin = ['registered-users'];
-    await Groups.join(systemGroupsToJoin, uid);
 
     callback(null, {
       uid: uid,
@@ -440,6 +502,7 @@ OneIDAuth.login = function (profile, callback) {
     if (!uid) {
       // New user
       const username = OneIDAuth.getUsernameFromEmail(profile.email);
+      const pictureURL = `${nconf.get('url')}/api/v3/plugins/oneid/avatar/${profile.id}`;
       if (!username) {
         username = profile.username;
       }
@@ -452,9 +515,21 @@ OneIDAuth.login = function (profile, callback) {
           fullname: profile.displayName,
           birthday: profile.birthday,
           oneid_name: profile.displayName,
+          uploadedpicture: pictureURL,
+          picture: pictureURL,
         },
-        (err, uid) => {
+        async (err, uid) => {
           if (err) return callback(err);
+
+          // Save user info
+          if (OneIDAuth.intranetEnabled) {
+            User.setUserField(uid, 'intranet_avatar', pictureURL);
+          }
+
+          // Auto confirm email
+          await User.setUserField(uid, 'email', profile.email);
+          await User.email.confirmByUid(uid);
+
           winston.verbose('[sso-oneid] Created user success');
           success(uid);
         }
@@ -463,6 +538,7 @@ OneIDAuth.login = function (profile, callback) {
       // Existed user
       // update user infomation
       User.setUserField(uid, 'oneid_name', profile.displayName);
+      User.setUserField(uid, 'account_id', profile.id);
       success(uid);
     }
   });
