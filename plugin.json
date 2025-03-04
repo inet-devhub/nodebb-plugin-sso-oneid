@@ -13,6 +13,7 @@
     { "hook": "static:api.routes", "method": "addApiRoutes" },
     { "hook": "static:user.delete", "method": "deleteUserData" },
     { "hook": "static:user.loggedOut", "method": "userLoggedOut" },
+    { "hook": "filter:user.logout", "method": "userLogout" },
     { "hook": "filter:user.whitelistFields", "method": "appendUserHashWhitelist" },
     { "hook": "filter:error.handle", "method": "handleErrors" }
   ],

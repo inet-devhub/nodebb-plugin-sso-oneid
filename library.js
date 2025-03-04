@@ -155,7 +155,7 @@ OneIDAuth.addApiRoutes = async ({ router, middleware, helpers }) => {
 
 OneIDAuth.clearSession = async function (req, res) {
   if (req.loggedIn && req.sessionID) {
-    // res.clearCookie(nconf.get('sessionKey'), meta.configs.cookie.get());
+    res.clearCookie(nconf.get('sessionKey'), meta.configs.cookie.get());
 
     const { uid } = req;
     const { sessionID } = req;
@@ -167,7 +167,7 @@ OneIDAuth.clearSession = async function (req, res) {
     await User.setUserField(uid, 'lastonline', Date.now() - meta.config.onlineCutoff * 60000);
     await db.sortedSetAdd('users:online', Date.now() - meta.config.onlineCutoff * 60000, uid);
 
-    // sockets.in(`sess_${sessionID}`).emit('checkSession', 0);
+    sockets.in(`sess_${sessionID}`).emit('checkSession', 0);
   }
 };
 
@@ -215,17 +215,18 @@ OneIDAuth.reloadAuthorization = function (_settings, _callback) {
 
 OneIDAuth.userLoggedOut = async ({ req, res, uid, sessionID }) => {
   winston.verbose('[sso-oneid] User logged out called');
-
-  // sockets.in(`sess_${sessionID}`).emit('checkSession', 0);
-  const redirectURL = `${OneIDAuth.baseURL}/api/oauth/logout?redirect_url=${nconf.get('url')}`;
-  const payload = {
-    next: redirectURL,
-  };
-
-  if (req.body.noscript === 'true') {
-    return res.redirect(payload.next);
+  const oneid = await OneIDAuth.getAssociation({uid: uid}, function(err, data) {
+    return data.oneid;
+  });
+  if (oneid) {
+    req.body.noscript = 'true';
   }
-  res.status(200).send(payload);
+};
+
+
+OneIDAuth.userLogout = async function (payload) {
+  const redirectURL = `${OneIDAuth.baseURL}/api/oauth/logout?redirect_url=${nconf.get('url')}`;
+  payload.next = redirectURL;
 };
 
 OneIDAuth.addMenuItem = function (custom_header, callback) {
@@ -436,6 +437,7 @@ OneIDAuth.getAssociation = function (data, callback) {
       return callback(err, data);
     }
 
+    if(!data.associations) data.associations = [];
     if (accountID) {
       data.associations.push({
         associated: true,
@@ -443,6 +445,7 @@ OneIDAuth.getAssociation = function (data, callback) {
         name: constants.name,
         icon: constants.admin.icon,
       });
+      data.oneid = true;
     }
 
     callback(null, data);
