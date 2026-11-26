@@ -40,7 +40,7 @@
 					</div>
 					<div class="mb-3">
 						<label for="secret">Secret</label>
-						<input type="password" autocomplete="off" id="secret" name="secret" title="Client Secret" class="form-control" placeholder="Client Secret">
+						<input type="password" autocomplete="new-password" id="secret" name="secret" title="Client Secret" class="form-control" placeholder="Client Secret">
 					</div>
 					<div class="mb-3">
 						<label for="refcode">RefCode</label>
@@ -68,7 +68,7 @@
 					</div>
 					<div class="mb-3">
 						<label for="intranetApiKey">API Key</label>
-						<input placeholder="Private (Secret) API Key here" type="password" autocomplete="off" class="form-control" id="intranetApiKey" name="intranetApiKey"/>
+						<input placeholder="Private (Secret) API Key here" type="password" autocomplete="new-password" class="form-control" id="intranetApiKey" name="intranetApiKey"/>
 					</div>
 				</div>
 
