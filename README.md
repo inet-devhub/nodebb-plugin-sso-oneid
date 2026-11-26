@@ -41,4 +41,4 @@ Restart NodeBB after saving.
 2. Create a GitHub Release with tag `v<version>` (for example `gh release create v1.1.0 --generate-notes`).
 3. The **Release** workflow checks the tag against `package.json`, runs the tests and publishes to npm with provenance.
 
-Publishing uses [npm trusted publishing](https://docs.npmjs.com/trusted-publishers): on npmjs.com, add this repository with workflow `release.yml` and environment `npm`. An `NPM_TOKEN` repository secret also works as a fallback.
+Publishing uses [npm trusted publishing](https://docs.npmjs.com/trusted-publishers) only (no npm token): the trusted publisher on npmjs.com is this repository, workflow `release.yml`, environment `npm`.
