@@ -4,11 +4,14 @@
   "description": "NodeBB OneID OAuth2 SSO",
   "main": "library.js",
   "scripts": {
-    "format": "prettier --write \"**/*.{js,cjs,jsx,ts,tsx,md,json}\""
+    "lint": "eslint .",
+    "format": "prettier --write \"**/*.{js,cjs,mjs,jsx,ts,tsx,md,json,yml}\"",
+    "format:check": "prettier --check \"**/*.{js,cjs,mjs,jsx,ts,tsx,md,json,yml}\"",
+    "test": "node --test test/"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/inet-devhub/nodebb-plugin-sso-oneid"
+    "url": "git+https://github.com/inet-devhub/nodebb-plugin-sso-oneid.git"
   },
   "keywords": [
     "nodebb",
@@ -26,19 +29,25 @@
   "bugs": {
     "url": "https://github.com/inet-devhub/nodebb-plugin-sso-oneid/issues"
   },
-  "readme": "",
-  "readmeFilename": "README.md",
+  "homepage": "https://github.com/inet-devhub/nodebb-plugin-sso-oneid#readme",
+  "files": [
+    "library.js",
+    "lib/",
+    "static/",
+    "templates/",
+    "plugin.json"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "eslint-config-nodebb": "0.1.1",
-    "passport-oauth2": "^1.8.0",
-    "prettier": "^3.5.1",
-    "querystring": "^0.2.1",
-    "sharp": "^0.33.5",
-    "utils-merge": "^1.0.1"
+    "passport-oauth2": "^1.8.0"
   },
   "devDependencies": {
-    "eslint": "8.x",
-    "eslint-plugin-import": "2.x"
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.15.0",
+    "globals": "^17.14.0",
+    "prettier": "^3.10.1"
   },
   "nbbpm": {
     "compatibility": "^4.0.0"

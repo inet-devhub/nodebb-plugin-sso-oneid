@@ -215,14 +215,13 @@ OneIDAuth.reloadAuthorization = function (_settings, _callback) {
 
 OneIDAuth.userLoggedOut = async ({ req, res, uid, sessionID }) => {
   winston.verbose('[sso-oneid] User logged out called');
-  const oneid = await OneIDAuth.getAssociation({uid: uid}, function(err, data) {
+  const oneid = await OneIDAuth.getAssociation({ uid: uid }, function (err, data) {
     return data.oneid;
   });
   if (oneid) {
     req.body.noscript = 'true';
   }
 };
-
 
 OneIDAuth.userLogout = async function (payload) {
   const redirectURL = `${OneIDAuth.baseURL}/api/oauth/logout?redirect_url=${nconf.get('url')}`;
@@ -437,7 +436,7 @@ OneIDAuth.getAssociation = function (data, callback) {
       return callback(err, data);
     }
 
-    if(!data.associations) data.associations = [];
+    if (!data.associations) data.associations = [];
     if (accountID) {
       data.associations.push({
         associated: true,
