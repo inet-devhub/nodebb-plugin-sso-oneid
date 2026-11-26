@@ -28,7 +28,6 @@ define('admin/plugins/sso-oneid', ['settings', 'alerts'], function (Settings, al
       wrapper.find('input[type="checkbox"][data-toggle-target]').each(function (i, checkbox) {
         checkbox = $(checkbox);
         if (checkbox.is(':checked') && !wrapper.find(checkbox.attr('data-toggle-target')).val()) {
-          // eslint-disable-next-line no-plusplus
           invalidSelector += (!invalidCount++ ? '' : ', ') + checkbox.attr('data-toggle-target');
         }
       });
@@ -45,7 +44,7 @@ define('admin/plugins/sso-oneid', ['settings', 'alerts'], function (Settings, al
             type: 'success',
             alert_id: 'sso-oneid-saved',
             title: 'Settings Saved',
-            message: 'Successfule.',
+            message: 'Settings saved successfully. Restart NodeBB to apply them.',
             clickfn: function () {
               socket.emit('admin.reload');
             },
