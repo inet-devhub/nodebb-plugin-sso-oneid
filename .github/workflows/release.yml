@@ -62,6 +62,9 @@ jobs:
       - name: Publish
         env:
           PRERELEASE: ${{ github.event.release.prerelease }}
+          # npm logs why a trusted-publishing (OIDC) exchange failed only at verbose
+          # level; tokens are redacted in npm's log output.
+          NPM_CONFIG_LOGLEVEL: verbose
         run: |
           npm --version
           if [ "$PRERELEASE" = "true" ]; then
