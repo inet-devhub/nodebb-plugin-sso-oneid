@@ -1,5 +1,8 @@
 'use strict';
 
+const querystring = require('node:querystring');
+const OAuth2Strategy = require('passport-oauth2');
+
 const User = require.main.require('./src/user');
 const Groups = require.main.require('./src/groups');
 const meta = require.main.require('./src/meta');
@@ -9,37 +12,25 @@ const sockets = require.main.require('./src/socket.io');
 const authenticationController = require.main.require('./src/controllers/authentication');
 const routeHelpers = require.main.require('./src/routes/helpers');
 const nconf = require.main.require('nconf');
-const async = require.main.require('async');
 const winston = require.main.require('winston');
 const passport = require.main.require('passport');
-const url = require.main.require('url');
 
-const utils = require('./static/lib/utils');
-const util = require.main.require('util');
-const { InternalOAuthError } = require('passport-oauth2');
-const querystring = require('querystring');
+const helpers = require('./lib/helpers');
+
+const { InternalOAuthError, AuthorizationError } = OAuth2Strategy;
 
 const constants = Object.freeze({
   name: 'oneid',
+  settingsKey: 'sso-oneid',
+  sessionStateKey: 'oneidOAuthState',
   admin: {
     route: '/plugins/sso-oneid',
     icon: 'fa-cogs',
   },
-  oauth2: {
-    callbackURL: '',
-    authorizationURL: '',
-    tokenURL: '',
-    clientID: '',
-    clientSecret: '',
-    refCode: '',
-    profileURL: '',
-    sharedTokenURL: '',
-    passReqToCallback: true,
-  },
 });
 
 const OneIDAuth = {
-  baseURL: 'https://one.th',
+  baseURL: helpers.DEFAULT_BASE_URL,
   authorizationURL: '/api/oauth/getcode',
   tokenURL: '/oauth/token',
   sharedTokenURL: '/api/oauth/shared-token',
@@ -54,12 +45,210 @@ const OneIDAuth = {
   },
 };
 
-const destroyAsync = util.promisify((req, callback) => req.session.destroy(callback));
-const logoutAsync = util.promisify((req, callback) => req.logout(callback));
+const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
 
-OneIDAuth.init = function (data, callback) {
+function forbiddenError() {
+  const err = new Error('forbidden');
+  err.code = 'forbidden';
+  return err;
+}
+
+function forbiddenRedirectURL() {
+  return helpers.oneIDLogoutURL(OneIDAuth.baseURL, `${nconf.get('url')}/error/forbidden`);
+}
+
+/**
+ * OneID token exchange. Replaces node-oauth's OAuth2#getOAuthAccessToken on the
+ * strategy's own OAuth2 client: the code exchange is form-encoded, the
+ * shared-token exchange is JSON and goes to a different endpoint.
+ * `this` is the node-oauth OAuth2 instance.
+ */
+function getOAuthAccessToken(code, params, callback) {
+  params = { ...(params || {}) };
+  params.client_id = this._clientId;
+  params.client_secret = this._clientSecret;
+
+  let tokenUrl = this._baseSite + this._accessTokenUrl;
+  let headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  let postData;
+
+  if (Object.prototype.hasOwnProperty.call(params, 'shared_token')) {
+    tokenUrl = this._baseSite + this._sharedTokenURL;
+    if (this._refCode) params.refcode = this._refCode;
+    headers = { 'Content-Type': 'application/json' };
+    postData = JSON.stringify(params);
+  } else {
+    const codeParam = params.grant_type === 'refresh_token' ? 'refresh_token' : 'code';
+    params[codeParam] = code;
+    postData = querystring.stringify(params);
+  }
+
+  this._request('POST', tokenUrl, headers, postData, null, (error, data) => {
+    if (error) return callback(error);
+    let results;
+    try {
+      results = JSON.parse(data);
+    } catch {
+      results = querystring.parse(data);
+    }
+    const accessToken = results.access_token;
+    const refreshToken = results.refresh_token;
+    delete results.refresh_token;
+    callback(null, accessToken, refreshToken, results);
+  });
+}
+
+/**
+ * OneID flavour of passport-oauth2. Subclassed rather than patching
+ * OAuth2Strategy.prototype, which is shared with every other plugin that
+ * resolves the same passport-oauth2 module.
+ */
+class OneIDStrategy extends OAuth2Strategy {
+  constructor(options, verify) {
+    super(options, verify);
+    this.name = constants.name;
+    this._profileURL = options.profileURL;
+    this._businessURL = options.businessURL;
+
+    this._oauth2._useAuthorizationHeaderForGET = true;
+    this._oauth2.getOAuthAccessToken = getOAuthAccessToken;
+    this._oauth2._refCode = options.refCode || '';
+    this._oauth2._sharedTokenURL = options.sharedTokenURL;
+  }
+
+  authenticate(req, options) {
+    options = options || {};
+
+    if (req.query && req.query.error) {
+      if (req.query.error === 'access_denied') {
+        return this.fail({ message: req.query.error_description });
+      }
+      return this.error(new AuthorizationError(req.query.error_description, req.query.error, req.query.error_uri));
+    }
+
+    let callbackURL = options.callbackURL || this._callbackURL;
+    if (callbackURL) {
+      callbackURL = new URL(callbackURL, helpers.originalURL(req, { proxy: this._trustProxy })).href;
+    }
+
+    // 1. Authorization-code callback: the code is only accepted together with
+    //    the state value this browser session was given (login CSRF protection).
+    if (req.query && req.query.code) {
+      const expected = req.session && req.session[constants.sessionStateKey];
+      if (req.session) delete req.session[constants.sessionStateKey];
+
+      if (typeof req.query.code !== 'string' || !helpers.stateMatches(expected, req.query.state)) {
+        winston.warn('[sso-oneid] Rejected authorization callback: missing or invalid state');
+        return this.error(new Error('[[error:csrf-invalid]]'));
+      }
+
+      const params = this.tokenParams(options);
+      params.grant_type = 'authorization_code';
+      if (callbackURL) params.redirect_uri = callbackURL;
+      return this._exchangeToken(req, req.query.code, params, false);
+    }
+
+    // 2. Shared-token hand-off from another OneID-integrated service.
+    const sharedToken = helpers.readSharedToken(req);
+    if (sharedToken) {
+      return this._exchangeToken(req, null, { shared_token: sharedToken }, true);
+    }
+
+    // 3. Start the authorization-code flow.
+    if (!req.session) {
+      return this.error(new Error('OneID login requires a session'));
+    }
+    const state = helpers.generateState();
+    req.session[constants.sessionStateKey] = state;
+
+    const params = {
+      ...this.authorizationParams(options),
+      response_type: 'code',
+      state,
+      client_id: this._oauth2._clientId,
+    };
+    if (callbackURL) params.redirect_uri = callbackURL;
+
+    const location = new URL(this._oauth2._authorizeUrl);
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null) location.searchParams.set(key, value);
+    }
+    this.redirect(location.href);
+  }
+
+  _exchangeToken(req, code, params, isSharedToken) {
+    this._oauth2.getOAuthAccessToken(code, params, (err, accessToken, refreshToken, results) => {
+      if (err) {
+        if (err.statusCode >= 400) {
+          if (req.session && req.session.registration) delete req.session.registration;
+
+          if (isSharedToken) {
+            // Shared tokens are single use and short lived; an expired, reused or
+            // wrong-environment token falls back to the normal login, which completes
+            // without a prompt because the user is already signed in at OneID.
+            winston.warn(`[sso-oneid] Shared token rejected by OneID (HTTP ${err.statusCode}), falling back to normal login`);
+            return req.res.redirect(`${nconf.get('relative_path')}/auth/${constants.name}`);
+          }
+
+          winston.warn(`[sso-oneid] Token exchange rejected by OneID (HTTP ${err.statusCode})`);
+          return OneIDAuth.clearSession(req, req.res)
+            .catch(e => winston.error(`[sso-oneid] Clear session error: ${e.message}`))
+            .then(() => req.res.redirect(forbiddenRedirectURL()));
+        }
+        return this.error(this._createOAuthError('Failed to obtain access token', err));
+      }
+      if (!accessToken) {
+        return this.error(new Error('Failed to obtain access token'));
+      }
+
+      this._loadUserProfile(accessToken, (err, profile) => {
+        if (err) return this.error(err);
+
+        const verified = (err, user, info) => {
+          if (err) return this.error(err);
+          if (!user) return this.fail(info);
+          this.success(user, info || {});
+        };
+
+        try {
+          this._verify(req, accessToken, refreshToken, results, profile, verified);
+        } catch (ex) {
+          return this.error(ex);
+        }
+      });
+    });
+  }
+
+  userProfile(accessToken, done) {
+    const get = url =>
+      new Promise((resolve, reject) => {
+        this._oauth2.get(url, accessToken, (err, body) => (err ? reject(err) : resolve(body)));
+      });
+
+    (async () => {
+      let profile;
+      try {
+        profile = helpers.parseProfile(await get(this._profileURL), constants.name);
+      } catch (err) {
+        return done(new InternalOAuthError('failed to fetch user profile', err));
+      }
+
+      // Business membership is only needed when a business allowlist is set.
+      // A failed lookup leaves it unknown (null); the allowlist check then denies.
+      try {
+        profile.associateBiz = helpers.parseBusinessIds(await get(this._businessURL));
+      } catch (err) {
+        winston.warn(`[sso-oneid] Could not fetch business membership for account ${profile.id}: ${err.message || err.statusCode}`);
+        profile.associateBiz = null;
+      }
+
+      done(null, profile);
+    })();
+  }
+}
+
+OneIDAuth.init = async function (data) {
   winston.verbose('[sso-oneid] Init sso configuration');
-  // const hostHelpers = require.main.require('./src/routes/helpers');
   routeHelpers.setupAdminPageRoute(data.router, '/admin/plugins/sso-oneid', (req, res) => {
     res.render('admin/plugins/sso-oneid', {
       title: 'One ID',
@@ -68,87 +257,77 @@ OneIDAuth.init = function (data, callback) {
   });
 
   routeHelpers.setupPageRoute(data.router, '/error/forbidden', [], async (req, res) => {
-    if (req.loggedIn) res.redirect('/');
-    const err = new Error();
-    err.code = 'forbidden';
-    err.message = `ขออภัย! บัญชีของคุณ <strong>ไม่อนุญาต</strong> ให้เข้าใช้งานระบบได้! <a href="${OneIDAuth.baseURL}/api/oauth/logout?redirect_url=${nconf.get('url')}/login">- Logout from One ID -</a>`;
+    if (req.loggedIn) {
+      return res.redirect(`${nconf.get('relative_path')}/`);
+    }
 
-    const _data = {
-      error: String(err.message),
+    const logoutURL = helpers.oneIDLogoutURL(OneIDAuth.baseURL, `${nconf.get('url')}/login`);
+    res.status(403).render('403', {
+      error: `ขออภัย! บัญชีของคุณ <strong>ไม่อนุญาต</strong> ให้เข้าใช้งานระบบได้! <a href="${logoutURL}">- Logout from One ID -</a>`,
       bodyClass: middlewareHelpers.buildBodyClass(req, res),
-    };
-
-    req.uid = 999;
-    res.render('403', _data);
+    });
   });
-
-  callback();
 };
 
-OneIDAuth.addApiRoutes = async ({ router, middleware, helpers }) => {
-  winston.verbose(`[sso-oneid] Add API route`);
+OneIDAuth.addApiRoutes = async ({ router, middleware, helpers: apiHelpers }) => {
+  winston.verbose('[sso-oneid] Add API route');
   const middlewares = [middleware.ensureLoggedIn];
+
   routeHelpers.setupApiRoute(router, 'get', '/oneid/avatar/:accountID', middlewares, async (req, res) => {
-    winston.verbose(`[sso-oneid] Avatar api was called`);
-    if (!OneIDAuth.intranetEnabled) return helpers.formatApiResponse(502, res, 'Intranet not connected');
-    const isAccountID = function (id) {
-      return /^[0-9]+/.test(id);
-    };
+    if (!OneIDAuth.intranetEnabled || !OneIDAuth.intranet.baseURL) {
+      return apiHelpers.formatApiResponse(502, res, 'Intranet not connected');
+    }
 
-    winston.verbose(`[sso-oneid] Validate Account ID`);
-    const accountID = req.params.accountID;
-    if (!isAccountID(accountID)) return helpers.formatApiResponse(403, res, 'Invalid account id');
-
-    const cropImageToSquare = async function (imageBuffer) {
-      const sharp = require('sharp');
-      try {
-        const image = sharp(imageBuffer);
-        const metadata = await image.metadata();
-
-        const width = metadata.width;
-        const height = metadata.height;
-        const size = Math.min(width, height);
-
-        const left = Math.floor((width - size) / 2);
-        const top = Math.floor((height - size) / 2);
-
-        return await image.extract({ left, top, width: size, height: size }).toBuffer();
-      } catch (e) {
-        winston.error(`[sso-oneid] Crop avatar error ${JSON.stringify(e)}`);
-        throw e;
-      }
-    };
+    // Must be digits only: the value is placed into the intranet URL, and Express
+    // has already decoded %2F, so anything looser allows path traversal there.
+    const { accountID } = req.params;
+    if (!helpers.isAccountID(accountID)) {
+      return apiHelpers.formatApiResponse(400, res, 'Invalid account id');
+    }
 
     try {
-      winston.verbose(`[sso-oneid] HttpClient get intranet avatar`);
-      const avatarURL = `${OneIDAuth.intranet.baseURL}/account/${accountID}/avatar`;
-
-      const opts = {
+      const avatarURL = `${OneIDAuth.intranet.baseURL.replace(/\/+$/, '')}/account/${encodeURIComponent(accountID)}/avatar`;
+      const response = await fetch(avatarURL, {
         method: 'GET',
-        signal: AbortSignal.timeout(3000), // 3 seconds
-        headers: {
-          'content-type': 'application/json',
-          Authorization: `Bearer ${OneIDAuth.intranet.apiKey}`,
-        },
-      };
+        signal: AbortSignal.timeout(3000),
+        headers: { Authorization: `Bearer ${OneIDAuth.intranet.apiKey}` },
+      });
 
-      const response = await fetch(avatarURL, opts);
-      const { headers } = response;
-      const body = await response.bytes();
-      const squareImg = await cropImageToSquare(body);
-
-      if (response.status == 200) {
-        res.writeHead(response.status, {
-          'Content-Type': headers.get('content-type'),
-        });
-        return res.end(squareImg);
+      if (response.status !== 200) {
+        winston.warn(`[sso-oneid] Avatar server returned HTTP ${response.status}`);
+        return apiHelpers.formatApiResponse(502, res, 'Avatar server returned an error');
+      }
+      if (Number(response.headers.get('content-length')) > AVATAR_MAX_BYTES) {
+        return apiHelpers.formatApiResponse(502, res, 'Avatar too large');
       }
 
-      winston.warn(`[sso-oneid] Avatar server return error`);
-      helpers.formatApiResponse(500, res, 'Server return error');
+      const body = Buffer.from(await response.arrayBuffer());
+      if (body.length > AVATAR_MAX_BYTES) {
+        return apiHelpers.formatApiResponse(502, res, 'Avatar too large');
+      }
+
+      const sharp = require.main.require('sharp');
+      const image = sharp(body);
+      const { width, height } = await image.metadata();
+      const size = Math.min(width, height);
+      const { data, info } = await image
+        .extract({
+          left: Math.floor((width - size) / 2),
+          top: Math.floor((height - size) / 2),
+          width: size,
+          height: size,
+        })
+        .toBuffer({ resolveWithObject: true });
+
+      res.set({
+        'Content-Type': `image/${info.format}`,
+        'Cache-Control': 'private, max-age=3600',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return res.status(200).end(data);
     } catch (e) {
-      winston.error(`[sso-oneid] Fetch user avatar error: ${JSON.stringify(e)}`);
-      return helpers.formatApiResponse(503, res, 'External intranet avatar error');
+      winston.error(`[sso-oneid] Fetch user avatar error: ${e.message}`);
+      return apiHelpers.formatApiResponse(503, res, 'External intranet avatar error');
     }
   });
 };
@@ -157,12 +336,11 @@ OneIDAuth.clearSession = async function (req, res) {
   if (req.loggedIn && req.sessionID) {
     res.clearCookie(nconf.get('sessionKey'), meta.configs.cookie.get());
 
-    const { uid } = req;
-    const { sessionID } = req;
+    const { uid, sessionID } = req;
 
     await User.auth.revokeSession(sessionID, uid);
-    await logoutAsync(req);
-    await destroyAsync(req);
+    await new Promise((resolve, reject) => req.logout(err => (err ? reject(err) : resolve())));
+    await new Promise((resolve, reject) => req.session.destroy(err => (err ? reject(err) : resolve())));
 
     await User.setUserField(uid, 'lastonline', Date.now() - meta.config.onlineCutoff * 60000);
     await db.sortedSetAdd('users:online', Date.now() - meta.config.onlineCutoff * 60000, uid);
@@ -171,61 +349,18 @@ OneIDAuth.clearSession = async function (req, res) {
   }
 };
 
-OneIDAuth.reloadAuthorization = function (_settings, _callback) {
-  winston.verbose(`[sso-oneid] Reload authorization function`);
-  async.waterfall(
-    [
-      function (callback) {
-        if (_settings) return callback(null, _settings);
-
-        winston.verbose(`[sso-oneid] Load settings configuration`);
-        meta.settings.get('sso-oneid', function (err, settings) {
-          if (err) return callback(err);
-          callback(null, settings);
-        });
-      },
-    ],
-    function (err, settings) {
-      if (err) {
-        winston.error(`[sso-oneid] Load authorization configure error`, err);
-        return;
-      }
-
-      winston.verbose(`[sso-oneid] Setting variables to new value`);
-      // Reset business check
-      OneIDAuth.businessCheck = [];
-      if (settings.businessList) {
-        for (const b of settings.businessList) {
-          OneIDAuth.businessCheck.push(b.id);
-        }
-      }
-
-      // Read block account
-      OneIDAuth.blockAccounts = [];
-      if (settings.denyAccountList) {
-        for (const b of settings.denyAccountList) {
-          OneIDAuth.blockAccounts.push(b.account_id);
-        }
-      }
-
-      if (_callback instanceof Function) _callback();
-    }
-  );
-};
-
-OneIDAuth.userLoggedOut = async ({ req, res, uid, sessionID }) => {
-  winston.verbose('[sso-oneid] User logged out called');
-  const oneid = await OneIDAuth.getAssociation({ uid: uid }, function (err, data) {
-    return data.oneid;
-  });
-  if (oneid) {
-    req.body.noscript = 'true';
+/** Reload the business allowlist and the block list from the ACP settings. */
+OneIDAuth.reloadAuthorization = async function (settings) {
+  if (!settings) {
+    settings = (await meta.settings.get(constants.settingsKey)) || {};
   }
+  OneIDAuth.businessCheck = helpers.toIdList((settings.businessList || []).map(b => b && b.id));
+  OneIDAuth.blockAccounts = helpers.toIdList((settings.denyAccountList || []).map(b => b && b.account_id));
 };
 
 OneIDAuth.userLogout = async function (payload) {
-  const redirectURL = `${OneIDAuth.baseURL}/api/oauth/logout?redirect_url=${nconf.get('url')}`;
-  payload.next = redirectURL;
+  payload.next = helpers.oneIDLogoutURL(OneIDAuth.baseURL, nconf.get('url'));
+  return payload;
 };
 
 OneIDAuth.addMenuItem = function (custom_header, callback) {
@@ -237,200 +372,134 @@ OneIDAuth.addMenuItem = function (custom_header, callback) {
   callback(null, custom_header);
 };
 
-OneIDAuth.getStrategy = function (strategies, callback) {
-  winston.verbose('[sso-oneid] SSO get strategy');
-  const opts = constants.oauth2;
-  opts.callbackURL = `${nconf.get('url')}/auth/${constants.name}/callback`;
+/** Passport verify callback: access checks, account lookup or creation, ban handling. */
+OneIDAuth.verify = async function (req, accessToken, refreshToken, params, profile, done) {
+  let uid;
+  let restrictOnDeny = false;
+  try {
+    profile.username = params && params.username;
+    await OneIDAuth.reloadAuthorization();
 
-  winston.verbose('[sso-oneid] Load setting');
-  meta.settings.get('sso-oneid', function (err, settings) {
-    if (err) return callback(err);
-    if (!settings.id || !settings.secret) {
-      return callback(null, strategies);
+    if (helpers.isBlocked(OneIDAuth.blockAccounts, profile.id)) {
+      winston.warn(`[sso-oneid] Blocked by account block list: ${profile.id}`);
+      throw forbiddenError();
     }
 
-    opts.clientID = settings.id;
-    opts.clientSecret = settings.secret;
-    opts.refCode = settings.refCode;
-    opts.authorizationURL = `${OneIDAuth.baseURL}${OneIDAuth.authorizationURL}`;
-    opts.tokenURL = `${OneIDAuth.baseURL}${OneIDAuth.tokenURL}`;
-    opts.profileURL = `${OneIDAuth.baseURL}${OneIDAuth.profileURL}`;
-    opts.businessURL = `${OneIDAuth.baseURL}${OneIDAuth.businessURL}`;
-    opts.sharedTokenURL = `${OneIDAuth.baseURL}${OneIDAuth.sharedTokenURL}`;
-    if (settings.url) options.callbackURL = settings.url + '/auth/' + constants.name.toLowerCase() + '/callback';
+    const access = helpers.businessAccess(OneIDAuth.businessCheck, profile.associateBiz);
+    if (access === 'unknown') {
+      // Fail closed, but do not mark the user as restricted for an outage.
+      winston.warn(`[sso-oneid] Business membership unknown for account ${profile.id}, denying login`);
+      throw forbiddenError();
+    }
+    if (access === 'deny') {
+      winston.warn(`[sso-oneid] Account ${profile.id} is not associated with any configured business`);
+      uid = await OneIDAuth.getUidByOneID(profile.id);
+      restrictOnDeny = true;
+      throw forbiddenError();
+    }
 
-    // Load sso-oneid config
-    OneIDAuth.intranetEnabled = settings.intranetSyncEnabled;
-    OneIDAuth.intranet = {
-      baseURL: settings.intranetApiServer,
-      apiKey: settings.intranetApiKey,
-    };
+    ({ uid } = await OneIDAuth.login(profile));
 
-    OneIDAuth.reloadAuthorization(settings);
+    const status = await OneIDAuth.isRestrictedUser(uid);
+    if (status.banned) {
+      if (status.reason !== 'forbidden') {
+        // Banned by an administrator: keep the ban.
+        throw forbiddenError();
+      }
+      // Restricted earlier by this plugin and now allowed again.
+      await OneIDAuth.allowUser(uid);
+    }
 
-    const PassportOAuth = require('passport-oauth2');
-    PassportOAuth.Strategy.prototype.authenticate = OneIDAuth.authenticate;
-
-    PassportOAuth.Strategy.prototype.userProfile = async function (accessToken, done) {
-      this._oauth2._useAuthorizationHeaderForGET = true;
-      const _self = this;
-
-      async.parallel(
-        {
-          _profile: function (callback) {
-            _self._oauth2.get(opts.profileURL, accessToken, function (err, body, res) {
-              winston.verbose('[sso-oneid] Fetch user profile');
-              if (err) return done(new InternalOAuthError('failed to fetch user profile', err));
-              try {
-                const oauth2User = JSON.parse(body).data;
-                const user = {
-                  id: oauth2User.id,
-                  email: oauth2User.thai_email,
-                  displayName: `${oauth2User.account_title_th}${oauth2User.first_name_th} ${oauth2User.last_name_th}`,
-                  provider: constants.name,
-                  birthday: oauth2User.birth_date,
-                };
-                if (oauth2User.account_category != 'Residential') {
-                  user.displayName = `${oauth2User.account_title_eng} ${oauth2User.first_name_eng} ${oauth2User.last_name_eng}`;
-                }
-                callback(null, user);
-              } catch (e) {
-                callback(e);
-              }
-            });
-          },
-          _biz: function (callback) {
-            _self._oauth2.get(opts.businessURL, accessToken, function (err, body, res) {
-              winston.verbose('[sso-oneid] Fetch user business associate');
-              if (err) return done(new InternalOAuthError('failed to fetch user associate business', err));
-              try {
-                const biz = [];
-                const userBiz = JSON.parse(body).data;
-                for (const b of userBiz) {
-                  biz.push(b.id);
-                }
-                callback(null, biz);
-              } catch (e) {
-                callback(e);
-              }
-            });
-          },
-        },
-        function (err, result) {
-          if (err) return done(new InternalOAuthError('failed to fetch user profile', err));
-          const user = result._profile;
-          user.associateBiz = result._biz;
-          return done(null, user);
+    if (req.session && req.session.registration) {
+      delete req.session.registration;
+    }
+    await authenticationController.onSuccessfulLogin(req, uid);
+    winston.verbose(`[sso-oneid] Successful login uid ${uid}`);
+    return done(null, { uid });
+  } catch (err) {
+    if (err && err.message === 'forbidden') {
+      try {
+        if (restrictOnDeny && uid) {
+          const status = await OneIDAuth.isRestrictedUser(uid);
+          if (!status.banned) await OneIDAuth.restrictedUser(uid, 'forbidden');
         }
-      );
-    }; // end prototype
+        await OneIDAuth.clearSession(req, req.res);
+      } catch (e) {
+        winston.error(`[sso-oneid] Restrict user error: ${e.message}`);
+      }
+      err.code = 'forbidden';
+      return done(err);
+    }
+    winston.error(`[sso-oneid] Passport authenticate error: ${err && err.message}`);
+    return done(err);
+  }
+};
 
-    const authenticator = new PassportOAuth(opts, function (req, accessToken, refreshToken, params, profile, done) {
-      winston.verbose(`[sso-oneid] Passport authenticator called`);
-      profile.username = params.username;
-      // Get uid
-      async.waterfall(
-        [
-          function (callback) {
-            OneIDAuth.reloadAuthorization(null, function () {
-              callback(null);
-            });
-          },
-          // Block account
-          function (callback) {
-            OneIDAuth.denyUser(profile, function (err) {
-              callback(err);
-            });
-          },
-          // Check associate biz
-          function (callback) {
-            OneIDAuth.checkAssociateBusiness(profile, function (err) {
-              if (!err) return callback(null);
+OneIDAuth.buildStrategy = async function (strategies) {
+  winston.verbose('[sso-oneid] SSO get strategy');
+  const settings = (await meta.settings.get(constants.settingsKey)) || {};
+  // ACP values take precedence over the environment variables.
+  const clientID = settings.id || process.env.SSO_ONEID_CLIENT_ID;
+  const clientSecret = settings.secret || process.env.SSO_ONEID_CLIENT_SECRET;
+  if (!clientID || !clientSecret) {
+    return strategies;
+  }
 
-              OneIDAuth.getUidByOneID(profile.id, function (_, uid) {
-                callback(err, { uid: uid });
-              });
-            });
-          },
-          // Login
-          function (callback) {
-            OneIDAuth.login(profile, function (err, user) {
-              if (err) return callback(err);
-              callback(null, user);
-            });
-          },
-        ],
-        async function (err, user) {
-          if (user && user.uid) {
-            user.banned = await OneIDAuth.isRestrictedUser(user.uid);
-            winston.verbose(`[sso-oneid] Get restricted user: ${user.uid} Banned status: ${JSON.stringify(user.banned)}`);
-          }
+  OneIDAuth.baseURL = helpers.normalizeBaseURL(settings.server);
+  OneIDAuth.intranetEnabled = Boolean(settings.intranetSyncEnabled) && !['false', 'off', '0'].includes(String(settings.intranetSyncEnabled));
+  OneIDAuth.intranet = {
+    baseURL: settings.intranetApiServer || '',
+    apiKey: settings.intranetApiKey || '',
+  };
+  await OneIDAuth.reloadAuthorization(settings);
 
-          if (!err && user.banned) {
-            if (user.banned.banned && user.banned.reason === 'forbidden') {
-              // Reset
-              OneIDAuth.allowUser(user.uid);
-              user.banned.banned = false;
-              user.banned.reason = null;
-              winston.verbose(`[sso-oneid] Reset restricted user: ${user.uid}`);
-            } else if (user.banned.banned) {
-              err = new Error('forbidden');
-            }
+  const strategy = new OneIDStrategy(
+    {
+      clientID,
+      clientSecret,
+      refCode: settings.refcode || settings.refCode || '',
+      authorizationURL: `${OneIDAuth.baseURL}${OneIDAuth.authorizationURL}`,
+      tokenURL: `${OneIDAuth.baseURL}${OneIDAuth.tokenURL}`,
+      profileURL: `${OneIDAuth.baseURL}${OneIDAuth.profileURL}`,
+      businessURL: `${OneIDAuth.baseURL}${OneIDAuth.businessURL}`,
+      sharedTokenURL: `${OneIDAuth.baseURL}${OneIDAuth.sharedTokenURL}`,
+      callbackURL: `${nconf.get('url')}/auth/${constants.name}/callback`,
+      passReqToCallback: true,
+    },
+    OneIDAuth.verify
+  );
+  passport.use(constants.name, strategy);
 
-            winston.verbose(`[sso-oneid] Prepare user restricted: ${JSON.stringify(user)}`);
-            // final check banned
-            if (!user.banned.banned) {
-              // normal user
-              winston.verbose(`[sso-oneid] Successful logged in: ${JSON.stringify(user)}`);
-              if (req.session.hasOwnProperty('registration')) {
-                delete req.session.registration;
-              }
-              authenticationController.onSuccessfulLogin(req, user.uid);
-              return done(null, { uid: user.uid });
-            }
-          }
-
-          if (err instanceof Error && err.message === 'forbidden') {
-            if (user && user.banned && !user.banned.banned) OneIDAuth.restrictedUser(user.uid, `${err.message}`);
-            err.code = 'forbidden';
-            OneIDAuth.clearSession(req, req.res);
-            return done(err);
-          }
-          winston.error(`[sso-oneid] Passport authenticate error: ${err}`);
-          done(err);
-        }
-      );
-    });
-
-    winston.verbose('[sso-oneid] Set custom oauth2 getOAuthAccessToken');
-    authenticator._oauth2.getOAuthAccessToken = OneIDAuth.getOAuthAccessToken;
-    authenticator._oauth2._refCode = `${opts.refCode}`;
-    authenticator._oauth2._sharedTokenURL = `${opts.sharedTokenURL}`;
-
-    passport.use(constants.name, authenticator);
-
-    winston.verbose('[sso-oneid] Push sso-oneid to authentication strategies');
-    strategies.push({
-      name: constants.name,
-      url: `/auth/${constants.name}`,
-      checkState: false,
-      callbackURL: `/auth/${constants.name}/callback`,
-      scope: ['identify', 'email'],
-      icons: {
-        svg: `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" height="16px" viewBox="0 0 208 192" class="LgbsSe-Bz112c"><image xlink:href="${nconf.get('url')}/plugins/nodebb-plugin-sso-oneid/images/sso-oneid.svg" x="0" y="0" width="208" height="192" /></svg>`,
-      },
-      labels: {
-        login: 'Sign in with One ID',
-        register: 'Sign up with One ID',
-      },
-    });
-
-    callback(null, strategies);
+  strategies.push({
+    name: constants.name,
+    url: `/auth/${constants.name}`,
+    // NodeBB's own state check would reject the shared-token hand-off on the
+    // callback route; OneIDStrategy checks `state` itself instead.
+    checkState: false,
+    callbackURL: `/auth/${constants.name}/callback`,
+    scope: ['identify', 'email'],
+    icons: {
+      svg: `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" height="16px" viewBox="0 0 208 192" class="LgbsSe-Bz112c"><image xlink:href="${nconf.get('url')}/plugins/nodebb-plugin-sso-oneid/images/sso-oneid.svg" x="0" y="0" width="208" height="192" /></svg>`,
+    },
+    labels: {
+      login: 'Sign in with One ID',
+      register: 'Sign up with One ID',
+    },
   });
+  return strategies;
+};
+
+OneIDAuth.getStrategy = function (strategies, callback) {
+  OneIDAuth.buildStrategy(strategies).then(
+    result => callback(null, result),
+    err => {
+      winston.error(`[sso-oneid] Could not set up the OneID strategy: ${err.message}`);
+      callback(err);
+    }
+  );
 };
 
 OneIDAuth.getAssociation = function (data, callback) {
-  winston.verbose('[sso-oneid] Get account associate to social auth');
   User.getUserField(data.uid, 'oneid', (err, accountID) => {
     if (err) {
       return callback(err, data);
@@ -440,173 +509,100 @@ OneIDAuth.getAssociation = function (data, callback) {
     if (accountID) {
       data.associations.push({
         associated: true,
-        url: 'https://one.th/portal_index',
+        url: `${OneIDAuth.baseURL}/portal_index`,
         name: constants.name,
         icon: constants.admin.icon,
       });
-      data.oneid = true;
     }
 
     callback(null, data);
   });
 };
 
-// reject oneid user
-OneIDAuth.denyUser = function (profile, callback) {
-  winston.verbose(`[sso-oneid] Check black list user: ${profile.id} - ${profile.username}`);
-  const setBlockAccounts = new Set(OneIDAuth.blockAccounts);
-  if (setBlockAccounts.has(profile.id)) {
-    winston.warn(`[sso-oneid] Block by account blacklist user: ${profile.id} - ${profile.username}`);
-    return callback(new Error('forbidden'));
-  }
-  callback(null);
-};
+/** Find or create the NodeBB user for a OneID profile and link the two. */
+OneIDAuth.login = async function (profile) {
+  let uid = await OneIDAuth.getUidByOneID(profile.id);
 
-OneIDAuth.checkAssociateBusiness = function (profile, callback) {
-  winston.verbose('[sso-oneid] Check account associate to configured business');
-  // nothing to do
-  if (OneIDAuth.businessCheck.length == 0) {
-    winston.verbose('[sso-oneid] No business list configure');
-    return callback(null);
-  }
-
-  // id not associate to any biz
-  if (!profile.associateBiz || (profile.associateBiz && profile.associateBiz.length == 0)) {
-    winston.warn(`[sso-oneid] Reject account ${profile.id} - ${profile.username} was no associate to any business`);
-    return callback(new Error('forbidden'));
-  }
-  const setBusinessCheck = new Set(OneIDAuth.businessCheck);
-  for (const b of profile.associateBiz) {
-    if (setBusinessCheck.has(b)) {
-      // existed
-      return callback(null);
+  if (!uid) {
+    const username = helpers.getUsernameFromEmail(profile.email) || profile.username;
+    if (!username) {
+      throw new Error('[[error:invalid-username]]');
     }
-  }
-  winston.warn(`[sso-oneid] Reject account ${profile.id} - ${profile.username} was no associate to configured business list`);
-  callback(new Error('forbidden'));
-};
+    const pictureURL = `${nconf.get('url')}/api/v3/plugins/oneid/avatar/${encodeURIComponent(profile.id)}`;
 
-OneIDAuth.login = function (profile, callback) {
-  winston.verbose(`[sso-oneid] Log in account: ${profile.id} - ${profile.username}`);
-
-  // Success login
-  const success = async uid => {
-    await User.setUserField(uid, 'oneid', profile.id);
-    await db.setObjectField('oneid:uid', profile.id, uid);
-
-    callback(null, {
-      uid: uid,
+    winston.verbose(`[sso-oneid] Create new user for account ${profile.id}`);
+    uid = await User.create({
+      username,
+      fullname: profile.displayName,
+      birthday: profile.birthday,
+      oneid_name: profile.displayName,
+      uploadedpicture: pictureURL,
+      picture: pictureURL,
     });
-  };
 
-  OneIDAuth.getUidByOneID(profile.id, function (err, uid) {
-    if (err) callback(err);
-    if (!uid) {
-      // New user
-      const username = OneIDAuth.getUsernameFromEmail(profile.email);
-      const pictureURL = `${nconf.get('url')}/api/v3/plugins/oneid/avatar/${profile.id}`;
-      if (!username) {
-        username = profile.username;
-      }
-      winston.verbose(`[sso-oneid] Create new user: ${username}`);
-      User.create(
-        {
-          username: username,
-          email: undefined, // auto confirm
-          userslug: username,
-          fullname: profile.displayName,
-          birthday: profile.birthday,
-          oneid_name: profile.displayName,
-          uploadedpicture: pictureURL,
-          picture: pictureURL,
-        },
-        async (err, uid) => {
-          if (err) return callback(err);
+    // Link straight away, so a failure further down can never create a second
+    // account on the next login attempt.
+    await OneIDAuth.link(uid, profile.id);
 
-          // Save user info
-          if (OneIDAuth.intranetEnabled) {
-            User.setUserField(uid, 'intranet_avatar', pictureURL);
-          }
-
-          // Auto confirm email
-          await User.setUserField(uid, 'email', profile.email);
-          await User.email.confirmByUid(uid);
-
-          winston.verbose('[sso-oneid] Created user success');
-          success(uid);
-        }
-      );
-    } else {
-      // Existed user
-      // update user infomation
-      User.setUserField(uid, 'oneid_name', profile.displayName);
-      User.setUserField(uid, 'account_id', profile.id);
-      success(uid);
+    if (OneIDAuth.intranetEnabled) {
+      await User.setUserField(uid, 'intranet_avatar', pictureURL);
     }
-  });
+    await OneIDAuth.assignEmail(uid, profile.email);
+  } else {
+    await User.setUserFields(uid, { oneid_name: profile.displayName, account_id: profile.id });
+  }
+
+  await OneIDAuth.link(uid, profile.id);
+  return { uid };
 };
 
-OneIDAuth.getUidByOneID = function (accountID, callback) {
-  winston.verbose(`[sso-oneid] Get Uid by One ID: ${accountID}`);
-
-  db.getObjectField('oneid:uid', accountID, function (err, uid) {
-    if (err) return callback(err);
-
-    if (uid) winston.verbose(`[sso-oneid] Found account uid: ${uid}`);
-    callback(null, uid);
-  });
+OneIDAuth.link = async function (uid, accountID) {
+  await User.setUserField(uid, 'oneid', accountID);
+  await db.setObjectField('oneid:uid', accountID, uid);
 };
 
-OneIDAuth.deleteUserData = function (data, callback) {
-  winston.verbose(`[sso-oneid] Delete user: ${JSON.stringify(data)}`);
-  async.waterfall(
-    [
-      async.apply(User.getUserField, data.uid, `oneid`),
-      function (oAuthIdToDelete, next) {
-        winston.verbose(`[sso-oneid] Delete account id: ${oAuthIdToDelete}`);
-        db.deleteObjectField(`oneid:uid`, oAuthIdToDelete, next);
-      },
-    ],
-    err => {
-      if (err) {
-        winston.error(`[sso-oneid] Could not remove OAuthId data for uid ${data.uid}. Error: ${JSON.stringify(err)}`);
-        return callback(err);
-      }
-
-      callback(null, data);
+/** Set the OneID e-mail as the user's confirmed e-mail, unless another account already owns it. */
+OneIDAuth.assignEmail = async function (uid, email) {
+  if (!email) return;
+  try {
+    if (!(await User.email.available(email))) {
+      winston.warn(`[sso-oneid] E-mail of uid ${uid} is already used by another account; not assigned`);
+      return;
     }
-  );
+    await User.setUserField(uid, 'email', email);
+    await User.email.confirmByUid(uid);
+  } catch (err) {
+    winston.warn(`[sso-oneid] Could not confirm e-mail for uid ${uid}: ${err.message}`);
+  }
 };
 
-// If this filter is not there, the deleteUserData function will fail when getting the oauthId for deletion.
+OneIDAuth.getUidByOneID = async function (accountID) {
+  return await db.getObjectField('oneid:uid', accountID);
+};
+
+OneIDAuth.deleteUserData = async function (data) {
+  const accountID = await User.getUserField(data.uid, 'oneid');
+  if (accountID) {
+    await db.deleteObjectField('oneid:uid', accountID);
+  }
+};
+
+// Without this, deleteUserData cannot read the `oneid` field.
 OneIDAuth.appendUserHashWhitelist = function (data, callback) {
   data.whitelist.push('oneid');
   setImmediate(callback, null, data);
 };
 
-OneIDAuth.getUsernameFromEmail = function (email) {
-  if (!email) {
-    return null;
-  }
-
-  const atIndex = email.indexOf('@');
-  if (atIndex === -1) {
-    return null;
-  }
-
-  return email.substring(0, atIndex);
-};
-
 OneIDAuth.handleErrors = function (data, next) {
-  data.cases['forbidden'] = async function (err, req, res, _next) {
-    return req.res.redirect(`${OneIDAuth.baseURL}/api/oauth/logout?redirect_url=${nconf.get('url')}/error/forbidden`);
+  data.cases.forbidden = async function (err, req, res) {
+    return res.redirect(forbiddenRedirectURL());
   };
   return next(null, data);
 };
 
 OneIDAuth.restrictedUser = async function (uid, reason) {
   winston.warn(`[sso-oneid] Set restricted to user: ${uid}`);
-  // Leaving all other system groups to have privileges constrained to the "banned-users" group
+  // Leave all other system groups so privileges are constrained to "banned-users"
   const systemGroups = Groups.systemGroups.filter(group => group !== Groups.BANNED_USERS);
   await Groups.leave(systemGroups, uid);
   await Groups.join(Groups.BANNED_USERS, uid);
@@ -616,171 +612,17 @@ OneIDAuth.restrictedUser = async function (uid, reason) {
 
 OneIDAuth.allowUser = async function (uid) {
   winston.warn(`[sso-oneid] Reset restricted to user: ${uid}`);
-
   await db.setObject(`user:${uid}`, { banned: 0, reason: 'accepted' });
-
-  await Groups.leave(Groups.BANNED_USERS, uid);
-  const systemGroupsToJoin = ['registered-users'];
-  await Promise.all([Groups.leave(Groups.BANNED_USERS, uid), Groups.join(systemGroupsToJoin, uid)]);
+  await Promise.all([Groups.leave(Groups.BANNED_USERS, uid), Groups.join(['registered-users'], uid)]);
 };
 
 OneIDAuth.isRestrictedUser = async function (uid) {
   const banned = await User.getUsersFields([uid], ['banned', 'reason']);
-  if (Array.isArray(banned) && banned.length == 1) return { banned: banned[0].banned, reason: banned[0].reason };
+  if (Array.isArray(banned) && banned.length === 1) return { banned: banned[0].banned, reason: banned[0].reason };
   return { banned: false };
 };
 
-OneIDAuth.getOAuthAccessToken = function (code, params, callback) {
-  winston.verbose('[sso-onied] Custom getOAuthAccessToken was called');
-  var params = params || {};
-  params['client_id'] = this._clientId;
-  params['client_secret'] = this._clientSecret;
-  var tokenUrl = this._baseSite + this._accessTokenUrl;
-  var post_headers = {
-    'Content-Type': 'application/x-www-form-urlencoded',
-  };
-  var post_data;
-
-  if (params.hasOwnProperty('shared_token')) {
-    tokenUrl = this._baseSite + this._sharedTokenURL;
-    params['refcode'] = this._refCode;
-    post_headers = {
-      'Content-Type': 'application/json',
-    };
-    post_data = JSON.stringify(params);
-  } else {
-    var codeParam = params.grant_type === 'refresh_token' ? 'refresh_token' : 'code';
-    params[codeParam] = code;
-    post_data = querystring.stringify(params);
-  }
-
-  this._request('POST', tokenUrl, post_headers, post_data, null, function (error, data, response) {
-    if (error) callback(error);
-    else {
-      var results;
-      try {
-        results = JSON.parse(data);
-      } catch (e) {
-        results = querystring.parse(data);
-      }
-      var access_token = results['access_token'];
-      var refresh_token = results['refresh_token'];
-      delete results['refresh_token'];
-      callback(null, access_token, refresh_token, results);
-    }
-  });
-};
-
-// Custom oneid authenticate
-OneIDAuth.authenticate = function (req, options) {
-  winston.verbose('[sso-onied] Custom authenticate was called');
-  options = options || {};
-  var self = this;
-
-  if (req.query && req.query.error) {
-    if (req.query.error == 'access_denied') {
-      return this.fail({ message: req.query.error_description });
-    } else {
-      return this.error(new AuthorizationError(req.query.error_description, req.query.error, req.query.error_uri));
-    }
-  }
-
-  var callbackURL = options.callbackURL || this._callbackURL;
-  if (callbackURL) {
-    var parsed = url.parse(callbackURL);
-    if (!parsed.protocol) {
-      callbackURL = url.resolve(utils.originalURL(req, { proxy: this._trustProxy }), callbackURL);
-    }
-  }
-
-  const getOAuthAccessToken = function (code, params) {
-    self._oauth2.getOAuthAccessToken(code, params, function (err, accessToken, refreshToken, params) {
-      if (err) {
-        if (err.hasOwnProperty('statusCode') && err.statusCode >= 400) {
-          if (req.session.hasOwnProperty('registration')) {
-            delete req.session.registration;
-          }
-          OneIDAuth.clearSession(req, req.res);
-          return req.res.redirect(`${OneIDAuth.baseURL}/api/oauth/logout?redirect_url=${nconf.get('url')}/error/forbidden`);
-        }
-        return self.error(self._createOAuthError('Failed to obtain access token', err));
-      }
-      if (!accessToken) {
-        return self.error(new Error('Failed to obtain access token'));
-      }
-
-      self._loadUserProfile(accessToken, function (err, profile) {
-        if (err) {
-          return self.error(err);
-        }
-
-        function verified(err, user, info) {
-          if (err) {
-            return self.error(err);
-          }
-          if (!user) {
-            return self.fail(info);
-          }
-
-          info = info || {};
-          self.success(user, info);
-        }
-
-        try {
-          if (self._passReqToCallback) {
-            var arity = self._verify.length;
-            if (arity == 6) {
-              self._verify(req, accessToken, refreshToken, params, profile, verified);
-            } else {
-              // arity == 5
-              self._verify(req, accessToken, refreshToken, profile, verified);
-            }
-          } else {
-            var arity = self._verify.length;
-            if (arity == 5) {
-              self._verify(accessToken, refreshToken, params, profile, verified);
-            } else {
-              // arity == 4
-              self._verify(accessToken, refreshToken, profile, verified);
-            }
-          }
-        } catch (ex) {
-          return self.error(ex);
-        }
-      });
-    });
-  };
-
-  if ((req.query && req.query.code) || (req.body && req.body.code)) {
-    var code = (req.query && req.query.code) || (req.body && req.body.code);
-
-    var params = self.tokenParams(options);
-    params.grant_type = 'authorization_code';
-    if (callbackURL) {
-      params.redirect_uri = callbackURL;
-    }
-    getOAuthAccessToken(code, params);
-  } else if ((req.query && req.query.sharedtoken) || (req.body && req.body.sharedtoken)) {
-    const params = {
-      shared_token: req.query.sharedtoken,
-    };
-
-    getOAuthAccessToken(null, params);
-  } else {
-    var params = this.authorizationParams(options);
-    params.response_type = 'code';
-    if (callbackURL) {
-      params.redirect_uri = callbackURL;
-    }
-
-    var parsed = url.parse(self._oauth2._authorizeUrl, true);
-    utils.merge(parsed.query, params);
-    parsed.query['client_id'] = self._oauth2._clientId;
-    delete parsed.search;
-
-    var location = url.format(parsed);
-    self.redirect(location);
-  }
-};
+// Exposed for tests.
+OneIDAuth._OneIDStrategy = OneIDStrategy;
 
 module.exports = OneIDAuth;
